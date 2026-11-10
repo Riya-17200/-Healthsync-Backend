@@ -45,6 +45,13 @@ const paymentSchema = new mongoose.Schema(
       default: "pending",
     },
 
+    // Number of times the patient has retried payment
+    retryCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
     razorpayOrderId: {
       type: String,
       default: null,
@@ -70,7 +77,7 @@ const paymentSchema = new mongoose.Schema(
       default: null,
     },
   },
-  { timestamps: true },
+  { timestamps: true }
 );
 
 module.exports = mongoose.model("Payment", paymentSchema);

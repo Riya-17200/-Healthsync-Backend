@@ -3,8 +3,8 @@ console.log("APPOINTMENT ROUTES LOADED");
 
 const express = require("express");
 const mongoose = require("mongoose");
-const router = express.Router();
 const crypto = require("crypto");
+const router = express.Router();
 
 const { paymentMode, razorpay } = require("../config/paymentGateway");
 
@@ -15,6 +15,8 @@ const Payment = require("../models/payment");
 
 const authMiddleware = require("../middleware/authMiddleware");
 const doctorVerificationMiddleware = require("../middleware/doctorVerificationMiddleware");
+
+const ONLINE_PAYMENT_WINDOW_MINUTES = 10;
 
 // Convert HH:mm into minutes
 function timeToMinutes(time) {
@@ -32,20 +34,107 @@ function getTodayIST() {
   }).formatToParts(new Date());
 
   const values = {};
-
-  for (const part of parts) {
-    values[part.type] = part.value;
-  }
+  for (const part of parts) values[part.type] = part.value;
 
   return `${values.year}-${values.month}-${values.day}`;
 }
 
+// Find another appointment that currently occupies an overlapping slot.
+// Online pending appointments occupy a slot only while their payment window is active.
+async function findSlotConflict({
+  doctorId,
+  appointmentDate,
+  startTime,
+  endTime,
+  excludeAppointmentId,
+}) {
+  const now = new Date();
+
+  const query = {
+    doctorId,
+    appointmentDate,
+    startTime: { $lt: endTime },
+    endTime: { $gt: startTime },
+    $or: [
+      { appointmentStatus: "confirmed" },
+      {
+        appointmentStatus: "pending",
+        paymentMethod: "cash",
+      },
+      {
+        appointmentStatus: "pending",
+        paymentMethod: { $in: ["upi", "card"] },
+        paymentStatus: "pending",
+        onlinePaymentExpiresAt: { $gt: now },
+      },
+    ],
+  };
+
+  if (excludeAppointmentId) {
+    query._id = { $ne: excludeAppointmentId };
+  }
+
+  return Appointment.findOne(query);
+}
+
+// Create a mock or Razorpay order.
+async function createOnlinePaymentOrder(payment, appointment) {
+  if (paymentMode === "mock") {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("Mock payments are disabled in production.");
+    }
+
+    const orderId =
+      "mock_order_" + crypto.randomBytes(12).toString("hex");
+
+    payment.mockOrderId = orderId;
+    payment.razorpayOrderId = null;
+    payment.razorpayPaymentId = null;
+
+    return {
+      paymentMode: "mock",
+      orderId,
+      amount: payment.amount,
+      currency: payment.currency,
+    };
+  }
+
+  if (paymentMode === "razorpay") {
+    if (!razorpay) {
+      throw new Error("Razorpay is not configured.");
+    }
+
+    const order = await razorpay.orders.create({
+      amount: Math.round(payment.amount * 100),
+      currency: payment.currency,
+      receipt: appointment._id.toString(),
+    });
+
+    payment.razorpayOrderId = order.id;
+    payment.mockOrderId = null;
+    payment.razorpayPaymentId = null;
+
+    return {
+      paymentMode: "razorpay",
+      orderId: order.id,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      amount: Math.round(payment.amount * 100),
+      currency: payment.currency,
+    };
+  }
+
+  throw new Error("Unsupported payment mode.");
+}
+
 // ==========================================
 // POST /api/appointments/book
-// Patient books an appointment
+// Patient books an appointment and starts online payment
 // ==========================================
 
 router.post("/book", authMiddleware, async (req, res) => {
+  let appointment = null;
+  let payment = null;
+
   try {
     const {
       doctorId,
@@ -94,10 +183,7 @@ router.post("/book", authMiddleware, async (req, res) => {
     }
 
     const [year, month, day] = appointmentDate.split("-").map(Number);
-
-    const appointmentDay = new Date(
-      Date.UTC(year, month - 1, day)
-    );
+    const appointmentDay = new Date(Date.UTC(year, month - 1, day));
 
     if (
       appointmentDay.getUTCFullYear() !== year ||
@@ -174,12 +260,10 @@ router.post("/book", authMiddleware, async (req, res) => {
     let selectedSchedule = dateSchedule;
 
     if (!selectedSchedule) {
-      const dayOfWeek = appointmentDay.getUTCDay();
-
       selectedSchedule = await DoctorSchedule.findOne({
         doctorId: doctor._id,
         scheduleType: "weekly",
-        dayOfWeek,
+        dayOfWeek: appointmentDay.getUTCDay(),
       });
     }
 
@@ -197,15 +281,11 @@ router.post("/book", authMiddleware, async (req, res) => {
       const scheduleEnd = timeToMinutes(slot.endTime);
       const duration = slot.slotDurationMinutes || 30;
 
-      const requestedDuration = requestedEnd - requestedStart;
-      const offset = requestedStart - scheduleStart;
-
       return (
         requestedStart >= scheduleStart &&
         requestedEnd <= scheduleEnd &&
-        requestedDuration === duration &&
-        offset >= 0 &&
-        offset % duration === 0
+        requestedEnd - requestedStart === duration &&
+        (requestedStart - scheduleStart) % duration === 0
       );
     });
 
@@ -216,23 +296,25 @@ router.post("/book", authMiddleware, async (req, res) => {
       });
     }
 
-    const existingAppointment = await Appointment.findOne({
+    const conflict = await findSlotConflict({
       doctorId: doctor._id,
       appointmentDate: appointmentDay,
-      appointmentStatus: {
-        $in: ["pending", "confirmed"],
-      },
-      startTime: { $lt: endTime },
-      endTime: { $gt: startTime },
+      startTime,
+      endTime,
     });
 
-    if (existingAppointment) {
+    if (conflict) {
       return res.status(409).json({
-        message: "This appointment slot is already booked.",
+        message: "This appointment slot is already booked or being held for payment.",
       });
     }
 
-    const appointment = await Appointment.create({
+    const isCash = paymentMethod === "cash";
+    const paymentExpiry = isCash
+      ? null
+      : new Date(Date.now() + ONLINE_PAYMENT_WINDOW_MINUTES * 60 * 1000);
+
+    appointment = await Appointment.create({
       patientId: req.user.userId,
       doctorId: doctor._id,
       appointmentDate: appointmentDay,
@@ -240,37 +322,66 @@ router.post("/book", authMiddleware, async (req, res) => {
       endTime,
       consultationFee: doctor.consultationFee,
       paymentMethod,
-      appointmentStatus: "confirmed",
+      appointmentStatus: isCash ? "confirmed" : "pending",
+      paymentStatus: "pending",
+      onlinePaymentExpiresAt: paymentExpiry,
+    });
+
+    payment = await Payment.create({
+      appointmentId: appointment._id,
+      patientId: req.user.userId,
+      doctorId: doctor._id,
+      amount: doctor.consultationFee,
+      currency: "INR",
+      paymentMethod,
       paymentStatus: "pending",
     });
 
-    let payment;
-
-    try {
-      payment = await Payment.create({
-        appointmentId: appointment._id,
-        patientId: req.user.userId,
-        doctorId: doctor._id,
-        amount: doctor.consultationFee,
-        currency: "INR",
-        paymentMethod,
-        paymentStatus: "pending",
+    // Cash appointment: confirmed immediately, no online order needed.
+    if (isCash) {
+      return res.status(201).json({
+        message: "Appointment booked successfully. Pay the doctor in cash.",
+        appointment,
+        payment,
       });
-    } catch (paymentError) {
-      await Appointment.findByIdAndDelete(appointment._id);
-      throw paymentError;
     }
 
-    return res.status(201).json({
-      message: "Appointment booked successfully. Payment is pending.",
-      appointment,
+    // UPI/Card: create payment order immediately during booking.
+    const orderDetails = await createOnlinePaymentOrder(
       payment,
+      appointment
+    );
+
+    await payment.save();
+
+    return res.status(201).json({
+      message: "Appointment held successfully. Complete payment within 10 minutes.",
+      appointment,
+      payment: {
+        _id: payment._id,
+        amount: payment.amount,
+        currency: payment.currency,
+        paymentMethod: payment.paymentMethod,
+        paymentStatus: payment.paymentStatus,
+        retryCount: payment.retryCount,
+      },
+      paymentOrder: orderDetails,
+      expiresAt: appointment.onlinePaymentExpiresAt,
     });
   } catch (error) {
     console.error("Appointment booking error:", error);
 
+    // Remove partially created records if booking/order creation fails.
+    if (payment) {
+      await Payment.findByIdAndDelete(payment._id).catch(() => {});
+    }
+
+    if (appointment) {
+      await Appointment.findByIdAndDelete(appointment._id).catch(() => {});
+    }
+
     return res.status(500).json({
-      message: "Server error while booking appointment.",
+      message: "Server error while booking appointment or creating payment order.",
     });
   }
 });
@@ -319,60 +430,11 @@ router.get(
   doctorVerificationMiddleware,
   async (req, res) => {
     try {
-      console.log("========== DATABASE DEBUG ==========");
-
-      console.log("Database:", mongoose.connection.name);
-      console.log("MongoDB Host:", mongoose.connection.host);
-      console.log("Collection:", Appointment.collection.name);
-
-      console.log(
-        "Doctor Profile ID:",
-        req.doctor._id.toString()
-      );
-
-      console.log(
-        "Doctor ID Type:",
-        typeof req.doctor._id,
-        req.doctor._id.constructor.name
-      );
-
-      const totalDocuments = await Appointment.countDocuments({});
-
-      console.log(
-        "Total appointments in backend DB:",
-        totalDocuments
-      );
-
-      const firstDocument = await Appointment.collection.findOne({});
-
-      console.log(
-        "FIRST DOCUMENT IN BACKEND DATABASE:",
-        JSON.stringify(firstDocument, null, 2)
-      );
-
-      const rawMatch = await Appointment.collection.findOne({
-        doctorId: new mongoose.Types.ObjectId(
-          req.doctor._id.toString()
-        ),
-      });
-
-      console.log(
-        "RAW MONGODB MATCHING DOCUMENT:",
-        JSON.stringify(rawMatch, null, 2)
-      );
-
       const appointments = await Appointment.find({
         doctorId: req.doctor._id,
       })
         .populate("patientId", "fullName email phoneNumber")
         .sort({ appointmentDate: 1, startTime: 1 });
-
-      console.log(
-        "MONGOOSE APPOINTMENTS FOUND:",
-        appointments.length
-      );
-
-      console.log("====================================");
 
       return res.status(200).json({
         message: "Doctor appointments fetched successfully.",
@@ -383,7 +445,7 @@ router.get(
       console.error("Fetch doctor appointments error:", error);
 
       return res.status(500).json({
-        message: "Server error while fetching appointments.",
+        message: "Server error while fetching doctor appointments.",
       });
     }
   }
@@ -421,20 +483,14 @@ router.patch("/:id/cancel", authMiddleware, async (req, res) => {
       });
     }
 
-    if (appointment.appointmentStatus === "cancelled") {
+    if (["cancelled", "completed"].includes(appointment.appointmentStatus)) {
       return res.status(400).json({
-        message: "Appointment is already cancelled.",
-      });
-    }
-
-    if (appointment.appointmentStatus === "completed") {
-      return res.status(400).json({
-        message: "Completed appointments cannot be cancelled.",
+        message: "This appointment cannot be cancelled.",
       });
     }
 
     appointment.appointmentStatus = "cancelled";
-
+    appointment.onlinePaymentExpiresAt = null;
     await appointment.save();
 
     return res.status(200).json({
@@ -480,20 +536,14 @@ router.patch(
         });
       }
 
-      if (appointment.appointmentStatus === "cancelled") {
+      if (appointment.appointmentStatus !== "confirmed") {
         return res.status(400).json({
-          message: "Cancelled appointments cannot be completed.",
-        });
-      }
-
-      if (appointment.appointmentStatus === "completed") {
-        return res.status(400).json({
-          message: "Appointment is already completed.",
+          message: "Only confirmed appointments can be completed.",
         });
       }
 
       appointment.appointmentStatus = "completed";
-
+      appointment.onlinePaymentExpiresAt = null;
       await appointment.save();
 
       return res.status(200).json({
@@ -557,15 +607,9 @@ router.patch(
         appointmentId: appointment._id,
       });
 
-      if (!payment) {
+      if (!payment || payment.paymentMethod !== "cash") {
         return res.status(404).json({
-          message: "Payment record not found.",
-        });
-      }
-
-      if (payment.paymentMethod !== "cash") {
-        return res.status(400).json({
-          message: "This API is only for cash payments.",
+          message: "Cash payment record not found.",
         });
       }
 
@@ -577,7 +621,6 @@ router.patch(
 
       payment.paymentStatus = "paid";
       payment.paidAt = new Date();
-
       await payment.save();
 
       appointment.paymentStatus = "paid";
@@ -593,7 +636,81 @@ router.patch(
 
       return res.status(500).json({
         message: "Server error while updating cash payment.",
-        error: error.message,
+      });
+    }
+  }
+);
+
+// ==========================================
+// PATCH /api/appointments/:id/refund
+// Mock refund
+// ==========================================
+
+router.patch(
+  "/:id/refund",
+  authMiddleware,
+  doctorVerificationMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!mongoose.isValidObjectId(id)) {
+        return res.status(400).json({
+          message: "Invalid appointment ID.",
+        });
+      }
+
+      if (paymentMode !== "mock" || process.env.NODE_ENV === "production") {
+        return res.status(503).json({
+          message: "This refund endpoint currently supports development mock mode only.",
+        });
+      }
+
+      const appointment = await Appointment.findOne({
+        _id: id,
+        doctorId: req.doctor._id,
+      });
+
+      if (!appointment) {
+        return res.status(404).json({
+          message: "Appointment not found for this doctor.",
+        });
+      }
+
+      if (appointment.paymentStatus !== "paid") {
+        return res.status(400).json({
+          message: "Only paid appointments can be refunded.",
+        });
+      }
+
+      const payment = await Payment.findOne({
+        appointmentId: appointment._id,
+        doctorId: req.doctor._id,
+      });
+
+      if (!payment || payment.paymentStatus !== "paid") {
+        return res.status(400).json({
+          message: "A paid payment record was not found.",
+        });
+      }
+
+      payment.paymentStatus = "refunded";
+      payment.refundedAt = new Date();
+      await payment.save();
+
+      appointment.paymentStatus = "refunded";
+      await appointment.save();
+
+      return res.status(200).json({
+        message: "Mock refund recorded successfully. No actual money was transferred.",
+        appointment,
+        payment,
+      });
+    } catch (error) {
+      console.error("Refund processing error:", error);
+
+      return res.status(500).json({
+        message: "Server error while processing refund.",
       });
     }
   }
@@ -601,7 +718,7 @@ router.patch(
 
 // ==========================================
 // POST /api/appointments/:id/create-payment-order
-// Create payment order for UPI/Card
+// Retry an online payment
 // ==========================================
 
 router.post(
@@ -634,21 +751,15 @@ router.post(
         });
       }
 
-      if (appointment.appointmentStatus === "cancelled") {
+      if (appointment.appointmentStatus !== "pending") {
         return res.status(400).json({
-          message: "Cannot pay for a cancelled appointment.",
+          message: "Only pending online appointments can be paid or retried.",
         });
       }
 
       if (!["upi", "card"].includes(appointment.paymentMethod)) {
         return res.status(400).json({
           message: "Online payment is not applicable to this appointment.",
-        });
-      }
-
-      if (appointment.paymentStatus === "paid") {
-        return res.status(400).json({
-          message: "This appointment is already paid.",
         });
       }
 
@@ -663,9 +774,15 @@ router.post(
         });
       }
 
-      if (payment.paymentStatus !== "pending") {
+      if (payment.paymentStatus === "paid") {
         return res.status(400).json({
-          message: "This payment cannot be processed.",
+          message: "This appointment is already paid.",
+        });
+      }
+
+      if (payment.paymentStatus === "refunded") {
+        return res.status(400).json({
+          message: "A refunded payment cannot be retried.",
         });
       }
 
@@ -678,58 +795,79 @@ router.post(
         });
       }
 
-      // MOCK PAYMENT MODE
-      if (paymentMode === "mock") {
-        if (process.env.NODE_ENV === "production") {
-          return res.status(403).json({
-            message: "Mock payments are disabled in production.",
-          });
-        }
+      const now = new Date();
+      const currentOrderStillActive =
+        payment.paymentStatus === "pending" &&
+        appointment.onlinePaymentExpiresAt &&
+        appointment.onlinePaymentExpiresAt > now &&
+        (paymentMode === "mock"
+          ? Boolean(payment.mockOrderId)
+          : Boolean(payment.razorpayOrderId));
 
-        if (!payment.mockOrderId) {
-          payment.mockOrderId =
-            "mock_order_" +
-            crypto.randomBytes(12).toString("hex");
-
-          await payment.save();
-        }
-
+      // If the original order is still active, return it instead of
+      // generating another order.
+      if (currentOrderStillActive) {
         return res.status(200).json({
-          message: "Mock payment order created successfully.",
-          paymentMode: "mock",
-          orderId: payment.mockOrderId,
-          amount: payment.amount,
+          message: "An active payment order already exists.",
+          paymentMode,
+          orderId:
+            paymentMode === "mock"
+              ? payment.mockOrderId
+              : payment.razorpayOrderId,
+          keyId:
+            paymentMode === "razorpay"
+              ? process.env.RAZORPAY_KEY_ID
+              : undefined,
+          amount:
+            paymentMode === "razorpay"
+              ? Math.round(payment.amount * 100)
+              : payment.amount,
           currency: payment.currency,
-          paymentStatus: payment.paymentStatus,
+          expiresAt: appointment.onlinePaymentExpiresAt,
+          retryCount: payment.retryCount || 0,
         });
       }
 
-      // RAZORPAY MODE
-      if (paymentMode === "razorpay") {
-        if (!payment.razorpayOrderId) {
-          const order = await razorpay.orders.create({
-            amount: Math.round(payment.amount * 100),
-            currency: payment.currency,
-            receipt: appointment._id.toString(),
-          });
+      // The old payment attempt failed or its 10-minute hold expired.
+      const conflict = await findSlotConflict({
+        doctorId: appointment.doctorId,
+        appointmentDate: appointment.appointmentDate,
+        startTime: appointment.startTime,
+        endTime: appointment.endTime,
+        excludeAppointmentId: appointment._id,
+      });
 
-          payment.razorpayOrderId = order.id;
-          await payment.save();
-        }
+      if (conflict) {
+        appointment.appointmentStatus = "cancelled";
+        appointment.onlinePaymentExpiresAt = null;
+        await appointment.save();
 
-        return res.status(200).json({
-          message: "Razorpay order created successfully.",
-          paymentMode: "razorpay",
-          orderId: payment.razorpayOrderId,
-          keyId: process.env.RAZORPAY_KEY_ID,
-          amount: Math.round(payment.amount * 100),
-          currency: payment.currency,
-          paymentStatus: payment.paymentStatus,
+        return res.status(409).json({
+          message: "This slot is no longer available. Please book another slot.",
         });
       }
 
-      return res.status(400).json({
-        message: "Unsupported payment mode.",
+      const orderDetails = await createOnlinePaymentOrder(
+        payment,
+        appointment
+      );
+
+      payment.paymentStatus = "pending";
+      payment.retryCount = (payment.retryCount || 0) + 1;
+      await payment.save();
+
+      appointment.paymentStatus = "pending";
+      appointment.onlinePaymentExpiresAt = new Date(
+        Date.now() + ONLINE_PAYMENT_WINDOW_MINUTES * 60 * 1000
+      );
+      await appointment.save();
+
+      return res.status(200).json({
+        message: "New payment retry order created successfully.",
+        ...orderDetails,
+        paymentStatus: payment.paymentStatus,
+        retryCount: payment.retryCount,
+        expiresAt: appointment.onlinePaymentExpiresAt,
       });
     } catch (error) {
       console.error("Payment order creation error:", error);
@@ -799,7 +937,6 @@ router.post(
         });
       }
 
-      // Idempotent response for an already-paid payment
       if (payment.paymentStatus === "paid") {
         return res.status(200).json({
           message: "Payment is already verified.",
@@ -810,7 +947,7 @@ router.post(
 
       if (payment.paymentStatus !== "pending") {
         return res.status(400).json({
-          message: "Payment is not in pending status.",
+          message: "Payment is not in pending status. Please create a retry order.",
         });
       }
 
@@ -836,17 +973,16 @@ router.post(
           });
         }
 
-        // Record failed payment.
-        // Appointment remains confirmed.
         if (paymentResult === "failed") {
           payment.paymentStatus = "failed";
           await payment.save();
 
           appointment.paymentStatus = "failed";
+          appointment.onlinePaymentExpiresAt = null;
           await appointment.save();
 
           return res.status(200).json({
-            message: "Mock payment failure recorded successfully.",
+            message: "Mock payment failure recorded. You can retry payment if the slot is still available.",
             appointment,
             payment,
           });
@@ -877,18 +1013,19 @@ router.post(
           });
         }
 
+        if (!process.env.RAZORPAY_KEY_SECRET) {
+          return res.status(500).json({
+            message: "Razorpay key secret is not configured.",
+          });
+        }
+
         const generatedSignature = crypto
-          .createHmac(
-            "sha256",
-            process.env.RAZORPAY_KEY_SECRET
-          )
-          .update(
-            razorpay_order_id + "|" + razorpay_payment_id
-          )
+          .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+          .update(razorpay_order_id + "|" + razorpay_payment_id)
           .digest("hex");
 
-        const received = Buffer.from(razorpay_signature);
-        const generated = Buffer.from(generatedSignature);
+        const received = Buffer.from(razorpay_signature, "utf8");
+        const generated = Buffer.from(generatedSignature, "utf8");
 
         if (
           received.length !== generated.length ||
@@ -903,9 +1040,7 @@ router.post(
           razorpay_payment_id
         );
 
-        if (
-          razorpayPayment.order_id !== payment.razorpayOrderId
-        ) {
+        if (razorpayPayment.order_id !== payment.razorpayOrderId) {
           return res.status(400).json({
             message: "Payment order mismatch.",
           });
@@ -945,19 +1080,42 @@ router.post(
         });
       }
 
-      // Update payment record after successful verification
+      // Check whether another patient booked the slot after this
+      // appointment's 10-minute payment hold expired.
+      const conflict = await findSlotConflict({
+        doctorId: appointment.doctorId,
+        appointmentDate: appointment.appointmentDate,
+        startTime: appointment.startTime,
+        endTime: appointment.endTime,
+        excludeAppointmentId: appointment._id,
+      });
+
       payment.paymentStatus = "paid";
       payment.paidAt = new Date();
-
       await payment.save();
 
-      // Update appointment payment status
-      appointment.paymentStatus = "paid";
+      if (conflict) {
+        // Payment was captured, but the original slot is no longer free.
+        // Do not confirm a conflicting appointment.
+        appointment.appointmentStatus = "cancelled";
+        appointment.paymentStatus = "paid";
+        appointment.onlinePaymentExpiresAt = null;
+        await appointment.save();
 
+        return res.status(409).json({
+          message: "Payment was received, but the slot is no longer available. Contact support to arrange a refund.",
+          appointment,
+          payment,
+        });
+      }
+
+      appointment.appointmentStatus = "confirmed";
+      appointment.paymentStatus = "paid";
+      appointment.onlinePaymentExpiresAt = null;
       await appointment.save();
 
       return res.status(200).json({
-        message: "Payment verified successfully.",
+        message: "Payment verified successfully. Appointment confirmed.",
         appointment,
         payment,
       });

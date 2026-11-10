@@ -53,6 +53,13 @@ const appointmentSchema = new mongoose.Schema(
       enum: ["pending", "paid", "failed", "refunded"],
       default: "pending",
     },
+
+    // Expiry time for online payment bookings.
+    // Cash appointments do not use this field.
+    onlinePaymentExpiresAt: {
+      type: Date,
+      default: null,
+    },
   },
   { timestamps: true }
 );

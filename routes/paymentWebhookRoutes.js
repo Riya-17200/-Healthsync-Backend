@@ -6,10 +6,13 @@ const router = express.Router();
 
 const Payment = require("../models/payment");
 const Appointment = require("../models/appointment");
+const WebhookEvent = require("../models/webhookEvent");
 
 router.post("/", async (req, res) => {
+  let webhookEvent = null;
+
   try {
-    // Webhook is only for real Razorpay payments.
+    // Webhooks are only used with real Razorpay payments.
     if (process.env.PAYMENT_MODE !== "razorpay") {
       return res.status(503).json({
         message: "Razorpay webhook is disabled in mock mode.",
@@ -32,7 +35,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Verify Razorpay signature.
+    // Verify Razorpay webhook signature using the original raw request body.
     const expectedSignature = crypto
       .createHmac("sha256", webhookSecret)
       .update(req.body)
@@ -52,13 +55,21 @@ router.post("/", async (req, res) => {
 
     const eventData = JSON.parse(req.body.toString("utf8"));
 
-    // Handle only payment events.
+    // Only process captured and failed payment events.
     if (
       eventData.event !== "payment.captured" &&
       eventData.event !== "payment.failed"
     ) {
       return res.status(200).json({
         message: "Event received but not handled.",
+      });
+    }
+
+    const eventId = req.headers["x-razorpay-event-id"];
+
+    if (!eventId || typeof eventId !== "string") {
+      return res.status(400).json({
+        message: "Webhook event ID is missing.",
       });
     }
 
@@ -70,7 +81,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Find payment using Razorpay order ID.
+    // Find the payment using the Razorpay order ID.
     const payment = await Payment.findOne({
       razorpayOrderId: paymentEntity.order_id,
     });
@@ -87,7 +98,7 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // Verify amount and currency against our database.
+    // Validate amount and currency.
     const expectedAmount = Math.round(payment.amount * 100);
 
     if (
@@ -99,6 +110,55 @@ router.post("/", async (req, res) => {
       });
     }
 
+    if (
+      paymentEntity.method &&
+      paymentEntity.method !== payment.paymentMethod
+    ) {
+      return res.status(400).json({
+        message: "Payment method mismatch.",
+      });
+    }
+
+    // Store the event ID so duplicate webhook deliveries are ignored.
+    try {
+      webhookEvent = await WebhookEvent.create({
+        eventId,
+        eventType: eventData.event,
+        status: "processing",
+      });
+    } catch (error) {
+      if (error.code === 11000) {
+        return res.status(200).json({
+          message: "Duplicate webhook event ignored.",
+        });
+      }
+
+      throw error;
+    }
+
+    const markEventProcessed = async () => {
+      await WebhookEvent.findByIdAndUpdate(webhookEvent._id, {
+        $set: {
+          status: "processed",
+          processedAt: new Date(),
+        },
+      });
+    };
+
+    const appointment = await Appointment.findById(
+      payment.appointmentId
+    );
+
+    if (!appointment) {
+      return res.status(404).json({
+        message: "Associated appointment not found.",
+      });
+    }
+
+    // ==========================================
+    // PAYMENT CAPTURED
+    // ==========================================
+
     if (eventData.event === "payment.captured") {
       if (!paymentEntity.id) {
         return res.status(400).json({
@@ -106,76 +166,136 @@ router.post("/", async (req, res) => {
         });
       }
 
-      // Do not overwrite an already refunded payment.
+      // Do not change a refunded payment.
       if (payment.paymentStatus === "refunded") {
+        await markEventProcessed();
+
         return res.status(200).json({
           message: "Payment is already refunded.",
         });
       }
 
-      // Update Payment record.
-      await Payment.findOneAndUpdate(
-        {
-          _id: payment._id,
-          paymentStatus: { $nin: ["paid", "refunded"] },
-        },
-        {
-          $set: {
-            paymentStatus: "paid",
-            razorpayPaymentId: paymentEntity.id,
-            paidAt: new Date(),
-          },
-        }
-      );
+      // Idempotent handling for an already-paid payment.
+      if (payment.paymentStatus === "paid") {
+        await markEventProcessed();
 
-      // Update linked Appointment record.
-      await Appointment.findByIdAndUpdate(payment.appointmentId, {
-        $set: {
-          paymentStatus: "paid",
-        },
+        return res.status(200).json({
+          message: "Payment is already processed.",
+        });
+      }
+
+      // Check whether another appointment now occupies this slot.
+      const conflictingAppointment = await Appointment.findOne({
+        _id: { $ne: appointment._id },
+        doctorId: appointment.doctorId,
+        appointmentDate: appointment.appointmentDate,
+        startTime: { $lt: appointment.endTime },
+        endTime: { $gt: appointment.startTime },
+        $or: [
+          { appointmentStatus: "confirmed" },
+          {
+            appointmentStatus: "pending",
+            paymentMethod: "cash",
+          },
+          {
+            appointmentStatus: "pending",
+            paymentMethod: { $in: ["upi", "card"] },
+            paymentStatus: "pending",
+            onlinePaymentExpiresAt: { $gt: new Date() },
+          },
+        ],
       });
 
+      // Record the captured payment.
+      payment.paymentStatus = "paid";
+      payment.razorpayPaymentId = paymentEntity.id;
+      payment.paidAt = new Date();
+
+      await payment.save();
+
+      if (
+        appointment.appointmentStatus === "cancelled" ||
+        appointment.appointmentStatus === "completed" ||
+        conflictingAppointment
+      ) {
+        // Money was captured, but the appointment cannot be confirmed.
+        // A real Razorpay refund must be handled separately.
+        appointment.appointmentStatus = "cancelled";
+        appointment.paymentStatus = "paid";
+        appointment.onlinePaymentExpiresAt = null;
+
+        await appointment.save();
+        await markEventProcessed();
+
+        return res.status(200).json({
+          message:
+            "Payment captured, but appointment could not be confirmed. Refund or support action is required.",
+        });
+      }
+
+      // Confirm the appointment only after successful payment capture.
+      appointment.appointmentStatus = "confirmed";
+      appointment.paymentStatus = "paid";
+      appointment.onlinePaymentExpiresAt = null;
+
+      await appointment.save();
+      await markEventProcessed();
+
       return res.status(200).json({
-        message: "Payment successfully marked as paid.",
+        message: "Payment successfully marked as paid and appointment confirmed.",
       });
     }
 
+    // ==========================================
+    // PAYMENT FAILED
+    // ==========================================
+
     if (eventData.event === "payment.failed") {
-      // Never downgrade an already paid or refunded payment.
+      // Never overwrite a successful or refunded payment.
       if (
         payment.paymentStatus === "paid" ||
         payment.paymentStatus === "refunded"
       ) {
+        await markEventProcessed();
+
         return res.status(200).json({
           message: "Payment already processed. No update required.",
         });
       }
 
-      // Only mark pending payments as failed.
-      await Payment.findOneAndUpdate(
-        {
-          _id: payment._id,
-          paymentStatus: "pending",
-        },
-        {
-          $set: {
-            paymentStatus: "failed",
-          },
-        }
-      );
+      if (payment.paymentStatus === "pending") {
+        payment.paymentStatus = "failed";
+        await payment.save();
 
-      await Appointment.findByIdAndUpdate(payment.appointmentId, {
-        $set: {
-          paymentStatus: "failed",
-        },
-      });
+        // Keep the appointment record so the patient can retry.
+        // Clearing the expiry releases the temporary slot hold.
+        if (appointment.appointmentStatus === "pending") {
+          appointment.paymentStatus = "failed";
+          appointment.onlinePaymentExpiresAt = null;
+          await appointment.save();
+        }
+      }
+
+      await markEventProcessed();
 
       return res.status(200).json({
-        message: "Payment marked as failed.",
+        message: "Payment marked as failed. The temporary slot hold has been released.",
       });
     }
   } catch (error) {
-    console.error("Razorpay webhook error:", error.message);
+    console.error("Razorpay webhook error:", error);
+
+    // Remove the processing event so Razorpay can retry delivery.
+    if (webhookEvent) {
+      await WebhookEvent.findByIdAndDelete(webhookEvent._id).catch(
+        (deleteError) => {
+          console.error(
+            "Webhook event cleanup error:",
+            deleteError.message
+          );
+        }
+      );
+    }
 
     return res.status(500).json({
       message: "Webhook processing failed.",
