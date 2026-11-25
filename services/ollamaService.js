@@ -12,7 +12,7 @@ const MODELS = {
 async function generateGroqResponse({
   prompt,
   system,
-  temperature = 0.1,
+  temperature = 0,
   timeout = 45000,
   format = undefined,
   num_predict = undefined,
@@ -31,7 +31,7 @@ async function generateGroqResponse({
   const payload = {
     model: GROQ_DEFAULT_MODEL,
     messages,
-    temperature: typeof temperature === "number" ? temperature : 0.1,
+    temperature: typeof temperature === "number" ? temperature : 0,
   };
 
   if (format === "json") {
@@ -78,7 +78,7 @@ async function generateResponse({
   prompt,
   system,
   think = false,
-  temperature = 0.2,
+  temperature = 0,
   timeout = 60000,
   format = undefined,
   num_predict = undefined,
@@ -155,7 +155,7 @@ async function generateMedicalResponse(prompt, system) {
     model: MODELS.medical,
     prompt,
     system,
-    temperature: 0.2,
+    temperature: 0,
     num_predict: 1000,
     timeout: 45000,
   });
@@ -167,7 +167,7 @@ async function generateAgentResponse(prompt, system) {
     model: MODELS.agent,
     prompt,
     system,
-    temperature: 0.1,
+    temperature: 0,
     format: "json",
     num_predict: 300,
     timeout: 30000,

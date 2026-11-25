@@ -491,7 +491,7 @@ ${documentText}
     model: MODELS.medical,
     prompt,
     system: MEDICAL_SUMMARY_SYSTEM_PROMPT,
-    temperature: 0.1,
+    temperature: 0,
     num_predict: REPORT_OUTPUT_TOKENS,
     timeout: REPORT_TIMEOUT_MS,
   });
