@@ -538,32 +538,18 @@ router.post("/forgot-password", async (req, res) => {
     const smtpPass = process.env.SMTP_PASS;
     const emailFrom = process.env.EMAIL_FROM || smtpUser;
     const frontendUrl = process.env.FRONTEND_URL;
+    const brevoApiKey = process.env.BREVO_API_KEY;
 
-    if (!smtpHost || !smtpUser || !smtpPass || !emailFrom || !frontendUrl) {
+    if (!frontendUrl || !emailFrom) {
       throw new Error("Email configuration is incomplete in the .env file.");
     }
-
-    const transporter = nodemailer.createTransport({
-      host: smtpHost,
-      port: smtpPort,
-      secure: smtpPort === 465,
-      auth: {
-        user: smtpUser,
-        pass: smtpPass,
-      },
-    });
 
     const resetLink =
       `${frontendUrl.replace(/\/$/, "")}/reset-password?token=${resetToken}&email=${encodeURIComponent(
         user.email
       )}`;
 
-    const emailResult = await transporter.sendMail({
-      from: emailFrom,
-      to: user.email,
-      subject: "HealthSync - Password Reset",
-
-      text: `Hello ${user.fullName || "there"},
+    const emailText = `Hello ${user.fullName || "there"},
 
 We received a request to reset your HealthSync password.
 
@@ -574,25 +560,76 @@ This link will expire in 10 minutes.
 
 If you did not request a password reset, you can ignore this email.
 
-HealthSync Team`,
+HealthSync Team`;
 
-      html: `
+    const emailHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; line-height: 1.6;">
           <h2>Reset your HealthSync password</h2>
           <p>Hello ${user.fullName || "there"},</p>
           <p>We received a request to reset your HealthSync password.</p>
           <p>
             <a href="${resetLink}"
-               style="display:inline-block;padding:12px 20px;background:#1769aa;color:#ffffff;text-decoration:none;border-radius:6px;">
+              style="display:inline-block;padding:10px 18px;background:#0d6efd;color:#ffffff;text-decoration:none;border-radius:6px;">
               Reset Password
             </a>
           </p>
+          <p>Or copy this link into your browser:</p>
+          <p>${resetLink}</p>
           <p>This link will expire in 10 minutes.</p>
-          <p>If you did not request this, you can safely ignore this email.</p>
+          <p>If you did not request a password reset, you can ignore this email.</p>
           <p>HealthSync Team</p>
         </div>
-      `,
-    });
+      `;
+
+    let emailResult;
+
+    if (brevoApiKey) {
+      // Use Brevo HTTP API (HTTPS port 443 - works reliably on Render)
+      const brevoResponse = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: {
+          "accept": "application/json",
+          "api-key": brevoApiKey.trim(),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          sender: { email: emailFrom.replace(/.*<(.+)>/, "$1").trim(), name: "HealthSync" },
+          to: [{ email: user.email, name: user.fullName || "User" }],
+          subject: "HealthSync - Password Reset",
+          textContent: emailText,
+          htmlContent: emailHtml,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (!brevoResponse.ok) {
+        const errText = await brevoResponse.text();
+        throw new Error(`Brevo API error (${brevoResponse.status}): ${errText}`);
+      }
+      emailResult = await brevoResponse.json();
+    } else {
+      if (!smtpHost || !smtpUser || !smtpPass) {
+        throw new Error("Email configuration is incomplete in the .env file.");
+      }
+
+      const transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: smtpPort,
+        secure: smtpPort === 465,
+        auth: {
+          user: smtpUser,
+          pass: smtpPass,
+        },
+      });
+
+      emailResult = await transporter.sendMail({
+        from: emailFrom,
+        to: user.email,
+        subject: "HealthSync - Password Reset",
+        text: emailText,
+        html: emailHtml,
+      });
+    }
 
     console.log(
       "Password reset email accepted by SMTP server:",
